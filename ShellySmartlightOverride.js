@@ -14,141 +14,110 @@
 //   - Long press sets the a sceen for the light group in dim/night-light mode 
 //
 // - Auto Failover Mode: Button toggles the Shelly relay on/off if HA is not responding
+//   *TODO: This has a bit of a delay while it checks if HA is up each time. Requires fix.
 //
 // - Manual Failover Mode: Holding the button down for 10+ seconds forces the relay off
 //
-// Note: This script currently checks the base URL for HA which responds with no
-// authorisation required. The ideal way to do this is to read the device MAC address
-// and use that to query the switch entity, however this requires a long lived auth
-// Token from HA, and there appears to be a bug in the Shelly firmware v1.4.2 which
-// does not pass the bearer token in the HTTP header correctly. This will be udpated
-// once Shelly resolve this issue.
+// Thanks to Grok for help coding and dugging
 
-var timer;
-//var ha_url = "http://10.0.0.99:8123/"; // Replace with your HA base URL
-
+// Custom variables - update with your own settings
 var ha_url = "http://10.0.0.99:8123/api/states/switch.library_shelly_pm1_switch_0";
-var ha_token = "<HA-long-lived-token";
-//MAC Address: 7C87CE654538
-//shellyplus1pm-7c87ce654538
+var ha_token = "<HA-long-lived-token>";
 
-Shelly.addEventHandler(function(e) {
-  if (e.component === "input:0") {
-    if (e.info.event === "btn_down") {
-      handleButtonDown();
- //   } else if (e.info.event === "btn_up") {
- //     handleButtonUp();
-    }
-  }
-});
+// Initialize variables
+let buttonDown = false;
+let timer = null;
 
-function handleButtonDown() {
-  Timer.clear(timer);
-  Shelly.call("Switch.GetStatus", {"id":0}, function(switchStatus) {
-    if (switchStatus.output) {
-      // Output is on, turn it off if held for 10+ seconds
-      checkHomeAssistantConnection(function(isConnected) {
-        if (isConnected) {
-            print("Home Assistant is connected");
-            timer = Timer.set("10000", false, relayOff);
-        } else {
-          print("Home Assistant is NOT connected");
-          relayOff();
-        }
-      });
-    } else {
-      // Output is off, turn it on immediately
-      relayOn();
-    }
-  });
-}
-
-function relayOff() {
-    print("Turning relay OFF");
-    Shelly.call("Switch.set", {"id":0, "on":false});
-}
-
-function relayOn() {
-    print("Turning relay ON");
-    Shelly.call("Switch.set", {"id":0, "on":true});
-}
-
-// Function to check connection with Home Assistant
-
-function checkHomeAssistantConnection() {
-  print("Checking Home Assistant status...");  
+// Function to check HA status (Version 2: checks HTTP status and entity state)
+function checkHomeAssistantUp(callback) {
+  print("Checking Home Assistant status...");
   Shelly.call(
     "http.request",
     {
       method: "GET",
       url: ha_url,
       headers: {
-        "Authorization": "Bearer " + ha_token,     // create long lived access token in HA and paste here
-        "Content-Type": "application/json"          // Set content type header
+        "Authorization": "Bearer " + ha_token,
+        "Content-Type": "application/json"
       }
     },
     function (response, error_code, error_message) {
-      if (response && response.code && response.code === 200) {
-        if (response.code === 200) {
-          print("Home Assistant is running! Status code: ", response.code);          
-        } else {
-          print("Home Assistant API error. Status code: ", response.code);
+      if (response && response.code === 200) {
+        try {
+          let data = JSON.parse(response.body);
+          print("Received entity state: " + data.state);
+          if (data.state === "on" || data.state === "off") {
+            print("Home Assistant is running! Entity state is valid.");
+            callback(true);
+          } else {
+            print("Invalid entity state: " + data.state);
+            callback(false);
+          }
+        } catch (e) {
+          print("Error parsing response: " + e);
+          callback(false);
         }
       } else {
-        print("Home Assistant is NOT responding. Error: ", error_message);
-      }
-    }
-  );
-}
-
-
-/* ----- old code ----- */
-
-
-function oldcheckHomeAssistantConnection(callback) {
-
-  Shelly.call("http.get", {url: ha_url},
-    function (result) {
-      if (result.code === 200) {
-       // If we get a 200 response, Home Assistant is connected
-        //print("HA Connection TRUE");
-        callback(true);
-      } else {
-        // Any other response means Home Assistant is not connected
-        print("HA Connection FALSE " + result.code);
+        print("Home Assistant is NOT responding. Error: " + error_message);
         callback(false);
       }
     }
   );
 }
 
-/*** Code below this line is experimental ***/
+// Button down handler
+function btn_down() {
+  print("Button pressed (btn_down)");
+  buttonDown = true;
+  Shelly.call("Switch.GetStatus", { id: 0 }, function(result) {
+    if (!result.output) {
+      print("Relay is OFF, turning ON immediately");
+      Shelly.call("Switch.Set", { id: 0, on: true });
+    } else {
+      print("Relay is ON, checking HA status");
+      checkHomeAssistantUp(function(haUp) {
+        if (!haUp) {
+          print("HA is NOT up, turning relay OFF immediately");
+          Shelly.call("Switch.Set", { id: 0, on: false });
+        } else {
+          print("HA is up, setting 10-second timer for long press");
+          if (timer === null) {
+            timer = Timer.set(10000, false, function() {
+              if (buttonDown) {
+                print("Button held for 10 seconds, turning relay OFF");
+                Shelly.call("Switch.Set", { id: 0, on: false });
+              } else {
+                print("Button released before 10 seconds, no action");
+              }
+              timer = null;
+            });
+          }
+        }
+      });
+    }
+  });
+}
 
-// function getEntityID(entity_id) {
-//   Shelly.call("Sys.GetStatus", {}, 
-//     function (result) {entity_id="shellyplus1pm-" + result.mac});
-// }
+// Button up handler
+function btn_up() {
+  print("Button released (btn_up)");
+  buttonDown = false;
+  if (timer !== null) {
+    print("Clearing timer");
+    Timer.clear(timer);
+    timer = null;
+  }
+}
 
-// Function to check connection with Home Assistant entity (currently broken)
-// function checkHomeAssistantConnection(callback) {
-//   Shelly.call(
-//     "http.get", {url: ha_url},
-//    {
-//      url: ha_url,
-//     headers: {
-//        Authorization: "Bearer " + ha_token
-//      }
-//    },
-//     function (result) {
-//       if (result.code === 200) {
-//         // If we get a 200 response, Home Assistant is connected
-//         print("HA Connection TRUE");
-//         callback(true);
-//       } else {
-//         // Any other response means Home Assistant is not connected
-//         print("HA Connection FALSE " + result.code);
-//         callback(false);
-//       }
-//     }
-//   );
-// }
+// Register button handlers
+Shelly.addEventHandler(function(event) {
+  if (event.component === "input:0") {
+    if (event.info.event === "btn_down") {
+      print("Event: Button down detected");
+      btn_down();
+    } else if (event.info.event === "btn_up") {
+      print("Event: Button up detected");
+      btn_up();
+    }
+  }
+});
